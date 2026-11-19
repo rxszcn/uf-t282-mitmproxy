@@ -256,13 +256,25 @@ class SaveHar:
             "timings": timings,
         }
 
-        if flow.request.method in ["POST", "PUT", "PATCH"]:
-            params = self.format_multidict(flow.request.urlencoded_form)
-            entry["request"]["postData"] = {
+        # Requests with a body are archived regardless of their method: a GET or DELETE
+        # may carry a body too, and dropping it would lose evidence. Empty-bodied
+        # POST/PUT/PATCH requests keep their previous postData entry.
+        if flow.request.method in ["POST", "PUT", "PATCH"] or flow.request.raw_content:
+            try:
+                request_content = flow.request.content
+            except ValueError:
+                request_content = flow.request.raw_content
+            post_data: dict[str, Any] = {
                 "mimeType": flow.request.headers.get("Content-Type", ""),
                 "text": flow.request.get_text(strict=False),
-                "params": params,
+                "params": self.format_multidict(flow.request.urlencoded_form),
             }
+            # Mirror the response side: binary bodies are stored base64-encoded and
+            # flagged, so that readers can restore the original bytes.
+            if request_content and strutils.is_mostly_bin(request_content):
+                post_data["text"] = base64.b64encode(request_content).decode()
+                post_data["encoding"] = "base64"
+            entry["request"]["postData"] = post_data
 
         if flow.server_conn.peername:
             entry["serverIPAddress"] = str(flow.server_conn.peername[0])

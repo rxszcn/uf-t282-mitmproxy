@@ -1,3 +1,4 @@
+import base64
 import json
 import zlib
 from pathlib import Path
@@ -14,6 +15,7 @@ from mitmproxy.exceptions import OptionsError
 from mitmproxy.http import Headers
 from mitmproxy.http import Request
 from mitmproxy.http import Response
+from mitmproxy.io.har import request_to_flow
 from mitmproxy.test import taddons
 from mitmproxy.test import tflow
 from mitmproxy.test import tutils
@@ -264,6 +266,99 @@ def test_content_raises():
         _ = flow.response.content
     # should not raise
     assert SaveHar().make_har([flow])
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE", "POST", "PUT", "PATCH"])
+def test_request_body_exported_for_all_methods(method: str):
+    """Bodied requests are archived regardless of the request method."""
+    body = b"q=hello" if method in ("GET", "DELETE") else b"a=1&b=2"
+    flow = tflow.tflow(
+        req=tutils.treq(method=method.encode(), content=body),
+    )
+    entry = SaveHar().flow_entry(flow, set())
+
+    assert entry["request"]["bodySize"] == len(body)
+    assert entry["request"]["postData"]["text"] == body.decode()
+    assert "encoding" not in entry["request"]["postData"]
+
+
+def test_get_request_body_roundtrip():
+    """A bodied GET survives export and import byte-for-byte."""
+    flow = tflow.tflow(req=tutils.treq(method=b"GET", content=b"q=hello"))
+    har = SaveHar().make_har([flow])
+
+    restored = request_to_flow(har["log"]["entries"][0])
+    assert restored.request.method == "GET"
+    assert restored.request.content == b"q=hello"
+
+
+def test_delete_request_body_roundtrip():
+    """A bodied DELETE survives export and import byte-for-byte."""
+    flow = tflow.tflow(
+        req=tutils.treq(
+            method=b"DELETE",
+            content=b"a=1&b=2",
+            headers=((b"content-type", b"application/x-www-form-urlencoded"),),
+        )
+    )
+    har = SaveHar().make_har([flow])
+
+    assert har["log"]["entries"][0]["request"]["postData"]["params"] == [
+        {"name": "a", "value": "1"},
+        {"name": "b", "value": "2"},
+    ]
+    restored = request_to_flow(har["log"]["entries"][0])
+    assert restored.request.method == "DELETE"
+    assert restored.request.content == b"a=1&b=2"
+
+
+def test_binary_request_body_base64():
+    """Binary request bodies are base64-encoded and flagged, like responses."""
+    content = b"\x89PNG\r\n\x1a\n" + bytes(range(64, 256)) * 3
+    flow = tflow.tflow(
+        req=tutils.treq(
+            method=b"POST",
+            content=content,
+            headers=((b"content-type", b"application/octet-stream"),),
+        )
+    )
+    post_data = SaveHar().flow_entry(flow, set())["request"]["postData"]
+
+    assert post_data["encoding"] == "base64"
+    assert post_data["text"] == base64.b64encode(content).decode()
+    assert post_data["mimeType"] == "application/octet-stream"
+
+
+def test_binary_request_body_roundtrip():
+    """A base64-marked request body is restored to the original bytes on import."""
+    content = b"\x89PNG\r\n\x1a\n" + bytes(range(64, 256)) * 3
+    flow = tflow.tflow(
+        req=tutils.treq(method=b"PUT", content=content),
+    )
+    har = SaveHar().make_har([flow])
+
+    restored = request_to_flow(har["log"]["entries"][0])
+    assert restored.request.content == content
+
+
+def test_empty_post_unchanged():
+    """Empty-bodied POST keeps the previous postData semantics."""
+    flow = tflow.tflow(req=tutils.treq(method=b"POST", content=b""))
+    entry = SaveHar().flow_entry(flow, set())
+
+    assert entry["request"]["postData"] == {
+        "mimeType": "",
+        "text": "",
+        "params": [],
+    }
+
+
+def test_empty_get_has_no_postdata():
+    """Empty-bodied requests other than POST/PUT/PATCH keep omitting postData."""
+    flow = tflow.tflow(req=tutils.treq(method=b"GET", content=b""))
+    entry = SaveHar().flow_entry(flow, set())
+
+    assert "postData" not in entry["request"]
 
 
 if __name__ == "__main__":

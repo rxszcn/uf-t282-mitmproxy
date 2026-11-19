@@ -8,6 +8,7 @@ from datetime import datetime
 from mitmproxy import connection
 from mitmproxy import exceptions
 from mitmproxy import http
+from mitmproxy.net.http import url
 from mitmproxy.net.http.headers import infer_content_encoding
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,50 @@ def fix_headers(
         flow_headers.append((key.encode(), value.encode()))
 
     return http.Headers(flow_headers)
+
+
+def postdata_to_content(post_data: dict) -> bytes | str:
+    """
+    Converts the request's ``postData`` object into request content.
+
+    The ``encoding`` marker is honored: ``base64`` marks a binary body and is decoded
+    back into the original bytes. Any other (unknown) marker is not in the HAR spec we
+    emit, so it is treated like an unmarked body — the text is returned as-is and a
+    warning is logged — which keeps older and third-party archives readable instead of
+    failing the whole archive.
+
+    Entries that only carry ``params`` (no ``text``) are supported as well: the body is
+    assembled from them, so that such entries remain readable.
+    """
+    text = post_data.get("text")
+    params = post_data.get("params") or []
+    encoding = post_data.get("encoding")
+
+    if encoding == "base64":
+        if text is None:
+            return b""
+        try:
+            return base64.b64decode(text)
+        except (ValueError, TypeError) as e:
+            raise exceptions.OptionsError(
+                f"Invalid base64-encoded request body: {e}"
+            ) from e
+    elif encoding:
+        logger.warning(
+            f"Unknown request body encoding {encoding!r}, treating body as text."
+        )
+
+    if text is not None:
+        return text
+    elif params:
+        return url.encode(
+            [
+                (str(param.get("name", "")), str(param.get("value", "")))
+                for param in params
+            ]
+        )
+    else:
+        return ""
 
 
 def request_to_flow(request_json: dict) -> http.HTTPFlow:
@@ -76,7 +121,7 @@ def request_to_flow(request_json: dict) -> http.HTTPFlow:
     new_flow = http.HTTPFlow(client_conn, server_conn)
 
     if "postData" in request_json["request"]:
-        request_content = request_json["request"]["postData"]["text"]
+        request_content = postdata_to_content(request_json["request"]["postData"])
 
     new_flow.request = http.Request.make(
         request_method, request_url, request_content, request_headers
